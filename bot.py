@@ -6,16 +6,12 @@ import threading
 import psycopg2
 import queue
 import smtplib
-import grpc
-from concurrent import futures
+import time
+from typing import List, Dict, Set
+from psycopg2 import sql
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from psycopg2 import sql
-from typing import List, Dict, Set
 from dotenv import load_dotenv
-
-import incident_service_pb2_grpc
-import incident_service_pb2
 
 load_dotenv()
 
@@ -30,7 +26,7 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')
 EMAIL_FROM = os.getenv('EMAIL_FROM', EMAIL_USER)
-GRPC_PORT = os.getenv('GRPC_PORT', '50051')
+BUFFER_TABLE_CHECK_INTERVAL = int(os.getenv('BUFFER_TABLE_CHECK_INTERVAL', '5'))
 
 if not all([BOT_TOKEN, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME, EMAIL_USER, EMAIL_PASSWORD]):
     raise ValueError("Не все необходимые переменные окружения установлены")
@@ -57,80 +53,157 @@ new_incidents: Set[int] = set()
 email_queue = queue.Queue()
 
 
-class NotifierServicer(incident_service_pb2_grpc.NotifierServicer):
-    def NotifyClientsAboutFall(self, request_iterator, context):
+class BufferTableProcessor:
+    def __init__(self, check_interval: int = 5):
+        self.check_interval = check_interval
+        self.running = False
+
+    def get_unprocessed_incidents(self) -> Dict[int, Dict]:
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, server_id, endpoint 
+                        FROM down_servers 
+                        ORDER BY id ASC
+                    """)
+
+                    results = cursor.fetchall()
+                    site_data = {}
+
+                    for row_id, server_id, endpoint in results:
+                        site_data[server_id] = {
+                            'id': row_id,
+                            'endpoint': endpoint
+                        }
+
+                    return site_data
+        except (Exception, psycopg2.Error) as error:
+            print("Ошибка при чтении из таблицы down_servers:", error)
+            return {}
+
+    def delete_processed_incidents(self, site_ids: List[int]):
+        if not site_ids:
+            return
+
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    query = sql.SQL("""
+                        DELETE FROM down_servers 
+                        WHERE server_id IN ({})
+                    """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
+                    cursor.execute(query)
+                    print(f"Удалены обработанные инциденты: {site_ids}")
+        except (Exception, psycopg2.Error) as error:
+            print("Ошибка при удалении из таблицы down_servers:", error)
+
+    def process_buffer_table(self):
         global failed_sites, new_incidents
 
-        incoming_sites = set()
-        for endpoint_message in request_iterator:
-            site_id = endpoint_message.endpoint
-            incoming_sites.add(site_id)
+        site_data = self.get_unprocessed_incidents()
+        incoming_sites = set(site_data.keys())
 
-        with site_ids_lock:
-            newly_failed = incoming_sites - failed_sites
-            new_incidents.update(newly_failed)
+        if incoming_sites:
+            print(f"Найдены новые инциденты в down_servers: {incoming_sites}")
 
-            failed_sites = incoming_sites
+            with site_ids_lock:
+                newly_failed = incoming_sites - failed_sites
+                new_incidents.update(newly_failed)
+                failed_sites.update(incoming_sites)
 
-            print(f"Получены инциденты: {incoming_sites}")
-            print(f"Новые инциденты: {newly_failed}")
+                print(f"Получены инциденты: {incoming_sites}")
+                print(f"Новые инциденты: {newly_failed}")
 
-        return incident_service_pb2.Response()
+            # Обновляем endpoint'ы для новых инцидентов
+            site_endpoints_cache = get_site_endpoints(list(incoming_sites))
+            for server_id, data in site_data.items():
+                if server_id not in site_endpoints_cache:
+                    site_endpoints_cache[server_id] = data['endpoint']
 
+            # Сохраняем обновленные endpoint'ы
+            update_site_endpoints(site_endpoints_cache)
 
-def run_grpc_server():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    incident_service_pb2_grpc.add_NotifierServicer_to_server(
-        NotifierServicer(), server
-    )
-    server.add_insecure_port(f'[::]:{GRPC_PORT}')
-    server.start()
-    print(f"gRPC сервер запущен на порту {GRPC_PORT}")
-    server.wait_for_termination()
+            # УДАЛЯЕМ обработанные инциденты из таблицы
+            self.delete_processed_incidents(list(incoming_sites))
 
+    def run(self):
+        self.running = True
 
-grpc_thread = threading.Thread(target=run_grpc_server, daemon=True)
-grpc_thread.start()
+        print(f"Запущен обработчик таблицы down_servers с интервалом {self.check_interval} сек")
 
+        while self.running:
+            try:
+                self.process_buffer_table()
+                time.sleep(self.check_interval)
+            except Exception as e:
+                print(f"Ошибка в обработчике таблицы down_servers: {e}")
+                time.sleep(self.check_interval)
 
-def get_users_with_emails(site_ids: List[int]) -> Dict[str, List[int]]:
-    try:
-        cursor = connection.cursor()
-        query = sql.SQL("""
-            SELECT DISTINCT u.email, us.site_id 
-            FROM users u
-            JOIN user_subscriptions us ON u.id = us.user_id
-            WHERE us.site_id IN ({}) AND u.email IS NOT NULL AND u.email != ''
-        """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
-        cursor.execute(query)
-        results = cursor.fetchall()
-        user_emails = {}
-        for email, site_id in results:
-            if email not in user_emails:
-                user_emails[email] = []
-            user_emails[email].append(site_id)
-        cursor.close()
-        return user_emails
-    except (Exception, psycopg2.Error) as error:
-        print("Ошибка при получении email пользователей:", error)
-        return {}
+    def stop(self):
+        self.running = False
 
 
 def get_site_endpoints(site_ids: List[int]) -> Dict[int, str]:
     try:
-        cursor = connection.cursor()
-        query = sql.SQL("""
-            SELECT id, endpoint 
-            FROM servers 
-            WHERE id IN ({})
-        """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
-        cursor.execute(query)
-        results = cursor.fetchall()
-        site_endpoints = {site_id: endpoint for site_id, endpoint in results}
-        cursor.close()
-        return site_endpoints
+        if not site_ids:
+            return {}
+
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("""
+                    SELECT id, endpoint 
+                    FROM servers 
+                    WHERE id IN ({})
+                """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
+                cursor.execute(query)
+                results = cursor.fetchall()
+                site_endpoints = {site_id: endpoint for site_id, endpoint in results}
+                return site_endpoints
     except (Exception, psycopg2.Error) as error:
-        print("Ошибка при получении endpoint'ов:", error)
+        print("Ошибка при получении endpoint'ов из servers:", error)
+        return {}
+
+
+def update_site_endpoints(site_endpoints: Dict[int, str]):
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                for site_id, endpoint in site_endpoints.items():
+                    cursor.execute("""
+                        UPDATE servers 
+                        SET endpoint = %s 
+                        WHERE id = %s AND (endpoint IS NULL OR endpoint != %s)
+                    """, (endpoint, site_id, endpoint))
+    except (Exception, psycopg2.Error) as error:
+        print("Ошибка при обновлении endpoint'ов:", error)
+
+
+buffer_processor = BufferTableProcessor(check_interval=BUFFER_TABLE_CHECK_INTERVAL)
+buffer_thread = threading.Thread(target=buffer_processor.run, daemon=True)
+buffer_thread.start()
+
+
+def get_users_with_emails(site_ids: List[int]) -> Dict[str, List[int]]:
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("""
+                    SELECT DISTINCT u.email, us.site_id 
+                    FROM users u
+                    JOIN user_subscriptions us ON u.id = us.user_id
+                    WHERE us.site_id IN ({}) AND u.email IS NOT NULL AND u.email != ''
+                """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
+                cursor.execute(query)
+                results = cursor.fetchall()
+                user_emails = {}
+                for email, site_id in results:
+                    if email not in user_emails:
+                        user_emails[email] = []
+                    user_emails[email].append(site_id)
+                return user_emails
+    except (Exception, psycopg2.Error) as error:
+        print("Ошибка при получении email пользователей:", error)
         return {}
 
 
@@ -201,21 +274,21 @@ email_thread.start()
 
 def get_users_subscribed_to_sites(site_ids: List[int]) -> Dict[int, List[int]]:
     try:
-        cursor = connection.cursor()
-        query = sql.SQL("""
-            SELECT us.user_id, us.site_id 
-            FROM user_subscriptions us 
-            WHERE us.site_id IN ({})
-        """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
-        cursor.execute(query)
-        results = cursor.fetchall()
-        user_sites = {}
-        for user_id, site_id in results:
-            if user_id not in user_sites:
-                user_sites[user_id] = []
-            user_sites[user_id].append(site_id)
-        cursor.close()
-        return user_sites
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("""
+                    SELECT us.user_id, us.site_id 
+                    FROM user_subscriptions us 
+                    WHERE us.site_id IN ({})
+                """).format(sql.SQL(',').join(map(sql.Literal, site_ids)))
+                cursor.execute(query)
+                results = cursor.fetchall()
+                user_sites = {}
+                for user_id, site_id in results:
+                    if user_id not in user_sites:
+                        user_sites[user_id] = []
+                    user_sites[user_id].append(site_id)
+                return user_sites
     except (Exception, psycopg2.Error) as error:
         print("Ошибка при выполнении запроса:", error)
         return {}
@@ -223,12 +296,12 @@ def get_users_subscribed_to_sites(site_ids: List[int]) -> Dict[int, List[int]]:
 
 def get_user_tg_username(user_id: int) -> str:
     try:
-        cursor = connection.cursor()
-        query = sql.SQL("SELECT tg_tag FROM users WHERE id = {}").format(sql.Literal(user_id))
-        cursor.execute(query)
-        result = cursor.fetchone()
-        cursor.close()
-        return result[0] if result and result[0] else ""
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("SELECT tg_tag FROM users WHERE id = {}").format(sql.Literal(user_id))
+                cursor.execute(query)
+                result = cursor.fetchone()
+                return result[0] if result and result[0] else ""
     except (Exception, psycopg2.Error) as error:
         print(f"Ошибка при получении username для пользователя {user_id}:", error)
         return ""
@@ -236,25 +309,24 @@ def get_user_tg_username(user_id: int) -> str:
 
 def update_user_chat_id(username: str, chat_id: int):
     try:
-        cursor = connection.cursor()
-        query = sql.SQL("UPDATE users SET chat_id = {} WHERE tg_tag = {}").format(
-            sql.Literal(chat_id), sql.Literal(username))
-        cursor.execute(query)
-        connection.commit()
-        cursor.close()
-        print(f"Обновлен chat_id для пользователя {username}: {chat_id}")
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("UPDATE users SET chat_id = {} WHERE tg_tag = {}").format(
+                    sql.Literal(chat_id), sql.Literal(username))
+                cursor.execute(query)
+                print(f"Обновлен chat_id для пользователя {username}: {chat_id}")
     except (Exception, psycopg2.Error) as error:
         print(f"Ошибка при обновлении chat_id для пользователя {username}:", error)
 
 
 def get_user_chat_id(user_id: int) -> int:
     try:
-        cursor = connection.cursor()
-        query = sql.SQL("SELECT chat_id FROM users WHERE id = {}").format(sql.Literal(user_id))
-        cursor.execute(query)
-        result = cursor.fetchone()
-        cursor.close()
-        return result[0] if result and result[0] else None
+        with connection:
+            with connection.cursor() as cursor:
+                query = sql.SQL("SELECT chat_id FROM users WHERE id = {}").format(sql.Literal(user_id))
+                cursor.execute(query)
+                result = cursor.fetchone()
+                return result[0] if result and result[0] else None
     except (Exception, psycopg2.Error) as error:
         print(f"Ошибка при получении chat_id для пользователя {user_id}:", error)
         return -1
@@ -280,10 +352,16 @@ def get_text_messages(message):
             response += f"Сайт {site_id}: {endpoint}\n"
         response += f"\nПользователей для уведомления: {len(user_sites)}"
         bot.reply_to(message, response)
+    elif message.text == "/clear_buffer":
+        # Очистка упавших сайтов (для тестирования)
+        with site_ids_lock:
+            failed_sites.clear()
+            new_incidents.clear()
+        bot.reply_to(message, "Кэш инцидентов очищен")
 
 
 async def periodic_send():
-    check_interval = 10
+    check_interval = 60
 
     while True:
         await asyncio.sleep(check_interval)
@@ -344,12 +422,13 @@ async_thread.start()
 def stop_email_worker():
     email_queue.put(None)
     email_thread.join()
+    buffer_processor.stop()
 
 
 atexit.register(stop_email_worker)
 
 print("Бот запущен с рассылкой уведомлений!")
-print(f"gRPC сервер слушает на порту {GRPC_PORT}")
+print("Обработчик таблицы down_servers запущен")
 
 if __name__ == "__main__":
     bot.polling(none_stop=True, interval=0)
