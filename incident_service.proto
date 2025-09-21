@@ -1,16 +1,12 @@
 syntax = "proto3";
 
-package incident;
 
-service IncidentService {
-  rpc ReportIncidents (IncidentRequest) returns (IncidentResponse);
+message Endpoint {
+    uint64 endpoint = 1;
 }
 
-message IncidentRequest {
-  repeated int32 site_ids = 1;
-}
+message Response {}
 
-message IncidentResponse {
-  bool success = 1;
-  string message = 2;
+service Notifier {
+    rpc NotifyClientsAboutFall(stream Endpoint) returns (Response);
 }

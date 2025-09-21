@@ -14,8 +14,8 @@ from psycopg2 import sql
 from typing import List, Dict, Set
 from dotenv import load_dotenv
 
-from . import incident_service_pb2 as incident_pb2
-from . import incident_service_pb2_grpc as incident_pb2_grpc
+import incident_service_pb2_grpc
+import incident_service_pb2
 
 load_dotenv()
 
@@ -57,13 +57,16 @@ new_incidents: Set[int] = set()
 email_queue = queue.Queue()
 
 
-class IncidentServiceServicer(incident_service_pb2_grpc.IncidentServiceServicer):
-    def ReportIncidents(self, request, context):
+class NotifierServicer(incident_service_pb2_grpc.NotifierServicer):
+    def NotifyClientsAboutFall(self, request_iterator, context):
         global failed_sites, new_incidents
 
-        with site_ids_lock:
-            incoming_sites = set(request.site_ids)
+        incoming_sites = set()
+        for endpoint_message in request_iterator:
+            site_id = endpoint_message.endpoint
+            incoming_sites.add(site_id)
 
+        with site_ids_lock:
             newly_failed = incoming_sites - failed_sites
             new_incidents.update(newly_failed)
 
@@ -72,16 +75,13 @@ class IncidentServiceServicer(incident_service_pb2_grpc.IncidentServiceServicer)
             print(f"Получены инциденты: {incoming_sites}")
             print(f"Новые инциденты: {newly_failed}")
 
-        return incident_service_pb2.IncidentResponse(
-            success=True,
-            message=f"Принято {len(incoming_sites)} инцидентов"
-        )
+        return incident_service_pb2.Response()
 
 
 def run_grpc_server():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    incident_service_pb2_grpc.add_IncidentServiceServicer_to_server(
-        IncidentServiceServicer(), server
+    incident_service_pb2_grpc.add_NotifierServicer_to_server(
+        NotifierServicer(), server
     )
     server.add_insecure_port(f'[::]:{GRPC_PORT}')
     server.start()
@@ -163,7 +163,6 @@ def send_simple_email(to_email: str, site_ids: List[int], site_endpoints: Dict[i
                 print(f"Ошибка аутентификации: {auth_error}")
                 raise auth_error
 
-            # Формируем сообщение
             msg = MIMEMultipart()
             msg['From'] = email_from
             msg['To'] = to_email
@@ -284,7 +283,7 @@ def get_text_messages(message):
 
 
 async def periodic_send():
-    check_interval = 600  # 10 минут
+    check_interval = 10
 
     while True:
         await asyncio.sleep(check_interval)
