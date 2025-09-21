@@ -6,11 +6,16 @@ import threading
 import psycopg2
 import queue
 import smtplib
+import grpc
+from concurrent import futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from psycopg2 import sql
-from typing import List, Dict
+from typing import List, Dict, Set
 from dotenv import load_dotenv
+
+from . import incident_service_pb2 as incident_pb2
+from . import incident_service_pb2_grpc as incident_pb2_grpc
 
 load_dotenv()
 
@@ -25,6 +30,7 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')
 EMAIL_FROM = os.getenv('EMAIL_FROM', EMAIL_USER)
+GRPC_PORT = os.getenv('GRPC_PORT', '50051')
 
 if not all([BOT_TOKEN, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME, EMAIL_USER, EMAIL_PASSWORD]):
     raise ValueError("Не все необходимые переменные окружения установлены")
@@ -43,8 +49,48 @@ except (Exception, psycopg2.Error) as error:
     exit()
 
 bot = telebot.TeleBot(BOT_TOKEN)
-siteIds = [71, 378, 5, 65, 57, 64, 19]  # данные от gRPC
+
+site_ids_lock = threading.Lock()
+failed_sites: Set[int] = set()
+new_incidents: Set[int] = set()
+
 email_queue = queue.Queue()
+
+
+class IncidentServiceServicer(incident_service_pb2_grpc.IncidentServiceServicer):
+    def ReportIncidents(self, request, context):
+        global failed_sites, new_incidents
+
+        with site_ids_lock:
+            incoming_sites = set(request.site_ids)
+
+            newly_failed = incoming_sites - failed_sites
+            new_incidents.update(newly_failed)
+
+            failed_sites = incoming_sites
+
+            print(f"Получены инциденты: {incoming_sites}")
+            print(f"Новые инциденты: {newly_failed}")
+
+        return incident_service_pb2.IncidentResponse(
+            success=True,
+            message=f"Принято {len(incoming_sites)} инцидентов"
+        )
+
+
+def run_grpc_server():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    incident_service_pb2_grpc.add_IncidentServiceServicer_to_server(
+        IncidentServiceServicer(), server
+    )
+    server.add_insecure_port(f'[::]:{GRPC_PORT}')
+    server.start()
+    print(f"gRPC сервер запущен на порту {GRPC_PORT}")
+    server.wait_for_termination()
+
+
+grpc_thread = threading.Thread(target=run_grpc_server, daemon=True)
+grpc_thread.start()
 
 
 def get_users_with_emails(site_ids: List[int]) -> Dict[str, List[int]]:
@@ -225,9 +271,12 @@ def get_text_messages(message):
             update_user_chat_id(username, user_id)
         bot.reply_to(message, "Бот запущен! Вы будете получать уведомления о проблемах с серверами.")
     elif message.text == "/test":
-        user_sites = get_users_subscribed_to_sites(siteIds)
-        site_endpoints = get_site_endpoints(siteIds)
-        response = f"Упавшие сайты: {siteIds}\n"
+        with site_ids_lock:
+            site_ids_to_check = list(failed_sites)
+
+        user_sites = get_users_subscribed_to_sites(site_ids_to_check)
+        site_endpoints = get_site_endpoints(site_ids_to_check)
+        response = f"Упавшие сайты: {site_ids_to_check}\n"
         for site_id, endpoint in site_endpoints.items():
             response += f"Сайт {site_id}: {endpoint}\n"
         response += f"\nПользователей для уведомления: {len(user_sites)}"
@@ -235,11 +284,20 @@ def get_text_messages(message):
 
 
 async def periodic_send():
-    while len(siteIds) > 0:
-        try:
-            print(f"Обнаружены изменения в упавших сайтах: {siteIds}")
-            site_endpoints = get_site_endpoints(siteIds)
-            user_sites = get_users_subscribed_to_sites(siteIds)
+    check_interval = 600  # 10 минут
+
+    while True:
+        await asyncio.sleep(check_interval)
+
+        with site_ids_lock:
+            incidents_to_send = list(new_incidents)
+            new_incidents.clear()
+
+        if incidents_to_send:
+            print(f"Обнаружены новые инциденты: {incidents_to_send}")
+            site_endpoints = get_site_endpoints(incidents_to_send)
+            user_sites = get_users_subscribed_to_sites(incidents_to_send)
+
             if user_sites:
                 print(f"Найдено {len(user_sites)} пользователей для уведомления")
                 for user_id, subscribed_sites in user_sites.items():
@@ -249,29 +307,30 @@ async def periodic_send():
                             username = get_user_tg_username(user_id)
                             print(f"Не найден chat_id для пользователя {user_id} ({username})")
                             continue
-                        user_specific_sites = [site_id for site_id in subscribed_sites if site_id in siteIds]
+
+                        user_specific_sites = [site_id for site_id in subscribed_sites if site_id in incidents_to_send]
                         endpoints_message = "\n".join([
                             f"• Сайт {site_id}: {site_endpoints[site_id]}"
                             for site_id in user_specific_sites
                         ])
+
                         message_text = (
                             "⚠️ Обнаружены проблемы с серверами!\n\n"
                             "Endpoint'ы упавших сайтов:\n"
                             f"{endpoints_message}\n\n"
                             "Рекомендуется проверить доступность сервисов."
                         )
+
                         bot.send_message(chat_id=chat_id, text=message_text)
                         print(f"Уведомление отправлено пользователю {chat_id}")
                     except Exception as e:
                         print(f"Ошибка отправки пользователю {user_id}: {e}")
             else:
                 print("Нет пользователей для уведомления")
-            email_queue.put(siteIds.copy())
-            siteIds.clear()
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"Ошибка в цикле рассылки: {e}")
-            await asyncio.sleep(60)
+
+            email_queue.put(incidents_to_send)
+        else:
+            print("Новых инцидентов не обнаружено")
 
 
 def run_async_loop():
@@ -291,7 +350,7 @@ def stop_email_worker():
 atexit.register(stop_email_worker)
 
 print("Бот запущен с рассылкой уведомлений!")
-print(f"Отслеживаемые site_id: {siteIds}")
+print(f"gRPC сервер слушает на порту {GRPC_PORT}")
 
 if __name__ == "__main__":
     bot.polling(none_stop=True, interval=0)
